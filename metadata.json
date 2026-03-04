@@ -1,0 +1,7 @@
+{
+  "name": "MangaSensei: Automation Hub v2",
+  "description": "Local-first manga analysis command center. Automate linguistic extraction for multiple chapters using Folder Batching or Manual Registry protocols.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
