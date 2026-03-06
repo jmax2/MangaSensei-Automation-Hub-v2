@@ -171,6 +171,76 @@ const ReaderView: React.FC<{
   const [rightWidth, setRightWidth] = useState(384);
   const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
   
+  // Settings State
+  const [showSettings, setShowSettings] = useState(false);
+  const [brightness, setBrightness] = useState(() => {
+    const saved = localStorage.getItem('mangasensei_brightness');
+    return saved ? parseInt(saved, 10) : 100;
+  });
+  const [fitMode, setFitMode] = useState<'fit-width' | 'fit-height' | 'original'>(() => {
+    const saved = localStorage.getItem('mangasensei_fitMode');
+    return (saved as any) || 'fit-height';
+  });
+
+  // Chatbot State
+  const [showChatbot, setShowChatbot] = useState(false);
+  const [chatMessages, setChatMessages] = useState<{role: 'user' | 'assistant', content: string}[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    localStorage.setItem('mangasensei_brightness', brightness.toString());
+  }, [brightness]);
+
+  useEffect(() => {
+    localStorage.setItem('mangasensei_fitMode', fitMode);
+  }, [fitMode]);
+
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages]);
+
+  const handleChatSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || isChatLoading) return;
+    
+    const userMsg = chatInput.trim();
+    setChatInput('');
+    setChatMessages(prev => [...prev, { role: 'user', content: userMsg }]);
+    setIsChatLoading(true);
+
+    try {
+      const { GoogleGenAI } = await import('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      // Build context from current page notes
+      const contextNotes = pageNotes.map(n => 
+        `Original: ${n.originalText}\nTranslation: ${n.translations.Japanese.text.replace(/<[^>]*>/g, '')}\nExplanation: ${n.explanation}`
+      ).join('\n\n');
+
+      const prompt = `You are a helpful Japanese language tutor assisting a user reading a manga chapter.
+Context from current page:
+${contextNotes || "No notes available for this page."}
+
+User Question: ${userMsg}`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt,
+      });
+
+      setChatMessages(prev => [...prev, { role: 'assistant', content: response.text || "I'm sorry, I couldn't generate a response." }]);
+    } catch (err) {
+      console.error("Chatbot error:", err);
+      setChatMessages(prev => [...prev, { role: 'assistant', content: "Sorry, I encountered an error while processing your request." }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+  
   // Resizing Logic
   const isResizingLeft = useRef(false);
   const isResizingRight = useRef(false);
@@ -532,8 +602,22 @@ const ReaderView: React.FC<{
       >
         {viewType === 'single' ? (
           pageUrls[page.id] && (
-            <div className="relative max-h-full max-w-full shadow-2xl animate-in fade-in zoom-in-95 duration-500">
-              <img src={pageUrls[page.id]} className="max-h-screen object-contain block" />
+            <div 
+              className={`relative shadow-2xl animate-in fade-in zoom-in-95 duration-500 flex items-center justify-center ${
+                fitMode === 'fit-width' ? 'w-full' : 
+                fitMode === 'fit-height' ? 'h-full max-h-screen' : 
+                'overflow-auto max-w-full max-h-full'
+              }`}
+            >
+              <img 
+                src={pageUrls[page.id]} 
+                className={`block ${
+                  fitMode === 'fit-width' ? 'w-full object-contain' : 
+                  fitMode === 'fit-height' ? 'h-full max-h-screen object-contain' : 
+                  'max-w-none'
+                }`} 
+                style={{ filter: `brightness(${brightness}%)` }}
+              />
               <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
                 {pageNotes.map(note => {
                   const { xmin, ymin, xmax, ymax } = note.boundingBox || { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
@@ -565,7 +649,12 @@ const ReaderView: React.FC<{
               >
                 {pageUrls[img.id] ? (
                   <>
-                    <img src={pageUrls[img.id]} className="w-full block" loading="lazy" />
+                    <img 
+                      src={pageUrls[img.id]} 
+                      className="w-full block" 
+                      loading="lazy" 
+                      style={{ filter: `brightness(${brightness}%)` }}
+                    />
                     <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
                         {chapter.notes.filter(n => n.pageIndex === idx).map(note => {
                         const { xmin, ymin, xmax, ymax } = note.boundingBox || { xmin: 0, ymin: 0, xmax: 0, ymax: 0 };
@@ -612,6 +701,21 @@ const ReaderView: React.FC<{
             onClick={() => setShowFurigana(!showFurigana)}
             className={`px-3 py-1.5 rounded-xl text-[10px] font-black transition-all ${showFurigana ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}
           >あ</button>
+          <div className="w-[1px] h-4 bg-slate-700 mx-1" />
+          <button 
+            onClick={() => setShowSettings(!showSettings)}
+            className={`p-2 rounded-xl transition-all ${showSettings ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}
+            title="Settings"
+          >
+            <Settings size={16} />
+          </button>
+          <button 
+            onClick={() => setShowChatbot(!showChatbot)}
+            className={`p-2 rounded-xl transition-all ${showChatbot ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}
+            title="AI Chatbot"
+          >
+            <MessageSquare size={16} />
+          </button>
           <div className="w-[1px] h-4 bg-slate-700 mx-1" />
           <button className="p-2 text-slate-400 hover:text-white transition-colors" onClick={() => {
               if (document.fullscreenElement) document.exitFullscreen();
@@ -751,6 +855,120 @@ const ReaderView: React.FC<{
           </div>
         </div>
       </div>
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl w-full max-w-md p-6 relative">
+            <button 
+              onClick={() => setShowSettings(false)}
+              className="absolute top-4 right-4 text-slate-500 hover:text-white transition-colors"
+            >
+              <X size={20} />
+            </button>
+            <h2 className="text-lg font-black uppercase tracking-widest text-indigo-400 mb-6 flex items-center gap-2">
+              <Settings size={18} /> Reader Settings
+            </h2>
+
+            <div className="space-y-6">
+              {/* Brightness */}
+              <div className="space-y-3">
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider flex justify-between">
+                  <span>Screen Brightness</span>
+                  <span className="text-indigo-400">{brightness}%</span>
+                </label>
+                <input 
+                  type="range" 
+                  min="10" 
+                  max="100" 
+                  value={brightness}
+                  onChange={(e) => setBrightness(parseInt(e.target.value))}
+                  className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+              </div>
+
+              {/* Fit Mode */}
+              <div className="space-y-3">
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Image Fit Mode</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { id: 'fit-width', label: 'Fit Width' },
+                    { id: 'fit-height', label: 'Fit Height' },
+                    { id: 'original', label: 'Original' }
+                  ].map(mode => (
+                    <button
+                      key={mode.id}
+                      onClick={() => setFitMode(mode.id as any)}
+                      className={`py-2 px-3 rounded-xl text-xs font-bold transition-all border ${fitMode === mode.id ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300' : 'bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700'}`}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Chatbot Panel */}
+      {showChatbot && (
+        <div className="fixed bottom-24 right-6 z-[150] w-80 sm:w-96 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl flex flex-col h-[500px] max-h-[70vh] animate-in slide-in-from-bottom-10 fade-in duration-300">
+          <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/50 rounded-t-2xl">
+            <h3 className="text-sm font-black uppercase tracking-widest text-indigo-400 flex items-center gap-2">
+              <Sparkles size={16} /> Sensei AI
+            </h3>
+            <button onClick={() => setShowChatbot(false)} className="text-slate-500 hover:text-white transition-colors">
+              <X size={16} />
+            </button>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto p-4 space-y-4 no-scrollbar">
+            {chatMessages.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center opacity-50 space-y-3">
+                <MessageSquare size={32} className="text-indigo-400" />
+                <p className="text-xs font-bold text-slate-400">Ask me anything about the current page, grammar, or cultural context!</p>
+              </div>
+            ) : (
+              chatMessages.map((msg, idx) => (
+                <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-sm' : 'bg-slate-800 text-slate-200 rounded-tl-sm border border-slate-700'}`}>
+                    {msg.content}
+                  </div>
+                </div>
+              ))
+            )}
+            {isChatLoading && (
+              <div className="flex justify-start">
+                <div className="bg-slate-800 text-slate-400 p-3 rounded-2xl rounded-tl-sm border border-slate-700 flex items-center gap-2">
+                  <Loader2 size={14} className="animate-spin" /> <span className="text-xs font-bold">Thinking...</span>
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          <form onSubmit={handleChatSubmit} className="p-3 border-t border-slate-800 bg-slate-950/50 rounded-b-2xl">
+            <div className="relative">
+              <input 
+                type="text" 
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder="Ask a question..."
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl py-2.5 pl-4 pr-10 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-white placeholder:text-slate-600"
+                disabled={isChatLoading}
+              />
+              <button 
+                type="submit" 
+                disabled={!chatInput.trim() || isChatLoading}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 bg-indigo-600 text-white rounded-lg disabled:opacity-50 hover:bg-indigo-500 transition-colors"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

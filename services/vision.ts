@@ -85,7 +85,28 @@ const visionWorkerCode = `
           }
           cnt.delete();
         }
-        self.postMessage({ id, bubbles });
+
+        // Spatial Bubble Grouping
+        const mergedBubbles = [];
+        for (const b of bubbles) {
+          let merged = false;
+          for (let m of mergedBubbles) {
+            // Check if they overlap or are very close (within 5% of width/height)
+            const dist = 5; 
+            if (b.xmin - dist < m.xmax && b.xmax + dist > m.xmin &&
+                b.ymin - dist < m.ymax && b.ymax + dist > m.ymin) {
+              m.xmin = Math.min(m.xmin, b.xmin);
+              m.ymin = Math.min(m.ymin, b.ymin);
+              m.xmax = Math.max(m.xmax, b.xmax);
+              m.ymax = Math.max(m.ymax, b.ymax);
+              merged = true;
+              break;
+            }
+          }
+          if (!merged) mergedBubbles.push(b);
+        }
+
+        self.postMessage({ id, bubbles: mergedBubbles });
       } finally {
         if (src) src.delete();
         if (gray) gray.delete();

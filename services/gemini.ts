@@ -2,11 +2,11 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Modality } from "@google/genai";
 import { StudyNote, WordBreakdown, BoundingBox, PreScreenMode, AIProvider, MasteryLevel } from "../types";
 // @ts-ignore
-import Tesseract from "tesseract.js";
+const Tesseract = (window as any).Tesseract;
 // @ts-ignore
 import * as wanakana from "wanakana";
 // @ts-ignore
-import kuromoji from "kuromoji";
+const kuromoji = (window as any).kuromoji;
 import { canvasPool } from "./canvasPool";
 import { detectSpeechBubblesWorker } from "./vision";
 
@@ -91,25 +91,48 @@ let tokenizerInstance: any = null;
 async function getTokenizer(): Promise<any> {
   if (tokenizerInstance) return tokenizerInstance;
   return new Promise((resolve) => {
-    kuromoji.builder({ dicPath: "https://takuyaa.github.io/kuromoji.js/demo/kuromoji/dict/" }).build((err: any, tokenizer: any) => {
-      if (err) {
-        console.error("Kuromoji dictionary load failed:", err);
-        // Return a mock tokenizer that just returns the input as a single token
-        const mockTokenizer = {
-          tokenize: (text: string) => [{
-            surface_form: text,
-            pos: 'unknown',
-            reading: '',
-            basic_form: text
-          }]
-        };
-        tokenizerInstance = mockTokenizer;
-        resolve(mockTokenizer);
-      } else {
-        tokenizerInstance = tokenizer;
-        resolve(tokenizer);
+    try {
+      if (!kuromoji || typeof kuromoji.builder !== 'function') {
+        console.error("Kuromoji not loaded correctly.");
+        throw new Error("Kuromoji not loaded correctly.");
       }
-    });
+      
+      // Use a more stable CDN for dictionaries
+      const dicPath = "https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict/";
+      
+      const builder = kuromoji.builder({ dicPath });
+      builder.build((err: any, tokenizer: any) => {
+        if (err) {
+          console.error("Kuromoji dictionary load failed:", err);
+          // Return a mock tokenizer that just returns the input as a single token
+          const mockTokenizer = {
+            tokenize: (text: string) => [{
+              surface_form: text,
+              pos: 'unknown',
+              reading: '',
+              basic_form: text
+            }]
+          };
+          tokenizerInstance = mockTokenizer;
+          resolve(mockTokenizer);
+        } else {
+          tokenizerInstance = tokenizer;
+          resolve(tokenizer);
+        }
+      });
+    } catch (err) {
+      console.error("Kuromoji builder error:", err);
+      const mockTokenizer = {
+        tokenize: (text: string) => [{
+          surface_form: text,
+          pos: 'unknown',
+          reading: '',
+          basic_form: text
+        }]
+      };
+      tokenizerInstance = mockTokenizer;
+      resolve(mockTokenizer);
+    }
   });
 }
 
@@ -126,20 +149,122 @@ function mapPOS(pos: string): 'verb' | 'noun' | 'adjective' | 'adverb' | 'partic
   return posMap[pos] || 'unknown';
 }
 
-async function localNLPAnalysis(ocrText: string, targetLanguage: string): Promise<StudyNote> {
-  const tokenizer = await getTokenizer();
-  const tokens = tokenizer.tokenize(ocrText);
+/**
+ * Simple, Free Translation Helper (No API Key Required)
+ * Uses the MyMemory API (Limit: ~1000 words/day per IP)
+ */
+async function translateText(text: string, from: string, to: string): Promise<string> {
+  try {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    
+    if (data.responseData && data.responseData.translatedText) {
+      return data.responseData.translatedText;
+    }
+    throw new Error("Translation data missing");
+  } catch (err) {
+    console.error("Translation failed, using original text:", err);
+    return text; // Fallback to original if network fails
+  }
+}
 
-  const breakdown: WordBreakdown[] = tokens.map((token: any) => {
+async function translateViaDeepL(text: string, apiKey: string): Promise<string> {
+  const url = `https://api-free.deepl.com/v2/translate`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `DeepL-Auth-Key ${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      text: [text],
+      target_lang: 'JA'
+    })
+  });
+  const data = await response.json();
+  return data.translations[0].text || text;
+}
+
+async function translateViaGoogleLite(text: string): Promise<string> {
+  const url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=ja&q=${encodeURIComponent(text)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  return data[0] || text; 
+}
+
+// 1. Database Configuration
+const DB_NAME = "MangaSensei_Dict";
+const STORE_NAME = "jmdict";
+
+async function initDictionaryDB(data: any[]) {
+  return new Promise((resolve) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = (e: any) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        // Index by kanji for fast lookups
+        db.createObjectStore(STORE_NAME, { keyPath: "kanji" });
+      }
+    };
+    request.onsuccess = (e: any) => {
+      const db = e.target.result;
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      const store = tx.objectStore(STORE_NAME);
+      // Bulk insert dictionary data (do this only once on first load)
+      data.forEach(item => store.put(item));
+      resolve(db);
+    };
+  });
+}
+
+// 2. The Lookup Heuristic
+async function getMeaning(kanji: string): Promise<string> {
+  return new Promise((resolve) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onsuccess = (e: any) => {
+      const db = e.target.result;
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const store = tx.objectStore(STORE_NAME);
+      const query = store.get(kanji);
+      query.onsuccess = () => resolve(query.result?.glossary || "Meaning not found");
+      query.onerror = () => resolve("[Lookup Failed]");
+    };
+  });
+}
+
+async function localNLPAnalysis(ocrText: string, targetLanguage: string): Promise<StudyNote> {
+  // 1. Detect if translation is needed (Source is EN, Target is JA)
+  const isEnglish = /^[a-zA-Z0-9\s.,!?'"-]+$/.test(ocrText);
+  let japaneseText = ocrText;
+
+  if (isEnglish) {
+    // Try DeepL first if API key is available, then Google Lite, then MyMemory
+    const deeplKey = import.meta.env.VITE_DEEPL_API_KEY || localStorage.getItem('deepl_api_key');
+    if (deeplKey) {
+      japaneseText = await translateViaDeepL(ocrText, deeplKey).catch(() => translateViaGoogleLite(ocrText).catch(() => translateText(ocrText, 'en', 'ja')));
+    } else {
+      japaneseText = await translateViaGoogleLite(ocrText).catch(() => translateText(ocrText, 'en', 'ja'));
+    }
+  }
+
+  // 3. Tokenize the (now Japanese) text
+  const tokenizer = await getTokenizer();
+  const tokens = tokenizer.tokenize(japaneseText);
+
+  // Parallel lookup for all tokens to keep it fast
+  const breakdown: WordBreakdown[] = await Promise.all(tokens.map(async (token: any) => {
+    const meaning = await getMeaning(token.basic_form || token.surface_form);
     return {
       japanese: token.surface_form,
       romaji: wanakana.toRomaji(token.surface_form),
-      meaning: "[Manual lookup required]",
-      notes: `Local JS fallback of ${token.basic_form || token.surface_form}`,
+      meaning: meaning, // Now pulled from IndexedDB!
+      notes: `Grammar: ${token.pos}`,
       partOfSpeech: mapPOS(token.pos)
     };
-  });
+  }));
 
+  // 5. Generate Ruby Text (Furigana)
   const rubyText = tokens.map((token: any) => {
     const hiragana = wanakana.toHiragana(token.reading || "");
     if (token.reading && token.surface_form !== hiragana && !/^\d+$/.test(token.surface_form)) {
@@ -151,16 +276,16 @@ async function localNLPAnalysis(ocrText: string, targetLanguage: string): Promis
   return {
     id: `local-nlp-${Date.now()}`,
     pageIndex: 0,
-    originalText: ocrText,
+    originalText: ocrText, // The original English
     speaker: "Unknown",
-    explanation: "Performed using local Kuromoji NLP engine after AI timeouts.",
+    explanation: "Reverse-analyzed via MyMemory + Kuromoji Local Engine.",
     type: "translation",
     targetLanguage,
     boundingBox: { ymin: 45, xmin: 45, ymax: 55, xmax: 55 },
     translations: {
       Japanese: {
-        text: rubyText,
-        reading: wanakana.toRomaji(ocrText),
+        text: rubyText, // The Japanese translation with Furigana
+        reading: wanakana.toRomaji(japaneseText),
         breakdown
       }
     }
@@ -169,12 +294,17 @@ async function localNLPAnalysis(ocrText: string, targetLanguage: string): Promis
 
 async function extractTextWithOCR(imageBase64: string): Promise<string[]> {
   try {
+    if (!Tesseract || typeof Tesseract.recognize !== 'function') {
+      console.error("Tesseract.js not loaded correctly.");
+      return [];
+    }
     const imageUrl = `data:image/jpeg;base64,${imageBase64}`;
     const result = await Tesseract.recognize(imageUrl, 'jpn+eng');
     return ((result.data as any).paragraphs || [])
       .map((p: any) => p.text.trim())
       .filter((t: string) => t.length > 1);
   } catch (err) {
+    console.error("Tesseract.js error:", err);
     return [];
   }
 }
@@ -547,6 +677,14 @@ async function performLocalOCRAnalysis(
   forceLocalNLP: boolean = false,
   onModelSwitch?: (modelName: string) => void
 ): Promise<StudyNote[]> {
+  if (onModelSwitch) onModelSwitch("Local OCR (Tesseract) - Initializing...");
+  
+  // Ensure Tesseract is available
+  if (!Tesseract || typeof Tesseract.recognize !== 'function') {
+    if (onModelSwitch) onModelSwitch("Error: Tesseract.js not loaded correctly.");
+    throw new Error("Tesseract.js not loaded correctly.");
+  }
+
   const imageUrl = `data:image/jpeg;base64,${imageBase64}`;
   const imgSize = await new Promise<{w: number, h: number}>((resolve) => {
     const i = new Image();
@@ -555,9 +693,13 @@ async function performLocalOCRAnalysis(
     i.src = imageUrl;
   });
 
+  if (onModelSwitch) onModelSwitch("Local OCR (Tesseract) - Recognizing Text...");
   const result = await Tesseract.recognize(imageUrl, 'jpn+eng');
   const { paragraphs } = result.data as any;
-  if (!paragraphs || paragraphs.length === 0) throw new Error("No usable text found by OCR.");
+  if (!paragraphs || paragraphs.length === 0) {
+    if (onModelSwitch) onModelSwitch("Local OCR - No text detected.");
+    throw new Error("No usable text found by OCR.");
+  }
   
   const ocrSegments = paragraphs.map((p: any) => ({
     text: p.text.trim(),
@@ -579,7 +721,7 @@ async function performLocalOCRAnalysis(
       }
     }
     
-    if (onModelSwitch) onModelSwitch("Local NLP (Kuromoji)");
+    if (onModelSwitch) onModelSwitch(`Local NLP (Kuromoji) - Analyzing ${ocrSegments.length} segments...`);
     const results: StudyNote[] = [];
     for (const [idx, seg] of ocrSegments.entries()) {
        const note = await localNLPAnalysis(seg.text, targetLanguage);
@@ -588,6 +730,7 @@ async function performLocalOCRAnalysis(
        note.boundingBox = seg.bbox;
        results.push(note);
     }
+    if (onModelSwitch) onModelSwitch(`Local NLP - Completed (${results.length} notes)`);
     return results;
   }
   throw new Error("No segments found after OCR.");
@@ -733,8 +876,10 @@ export async function waterfallAnalysis(
           }
         }
       }
-    } catch (err) {
+    } catch (err: any) {
+      const errorMsg = err?.message || String(err);
       console.warn(`Smart Cycle: Provider ${currentProvider} failed, trying next...`, err);
+      if (onModelSwitch) onModelSwitch(`Error: ${currentProvider} failed (${errorMsg.substring(0, 50)}...)`);
     }
   }
 
